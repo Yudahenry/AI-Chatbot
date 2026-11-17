@@ -2,8 +2,6 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const bodyParser = require("body-parser");
-const { Client, LocalAuth } = require("whatsapp-web.js");
-const qrcode = require("qrcode-terminal");
 const Groq = require("groq-sdk");
 const fs = require("fs");
 const path = require("path");
@@ -11,37 +9,58 @@ const RAGEngine = require("./lib/rag");
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const IS_VERCEL = Boolean(process.env.VERCEL);
 
 app.use(cors());
 app.use(bodyParser.json());
 app.use(express.static(path.join(__dirname, "public")));
 
-let groq = null;
-if (process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq") {
-  groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+// Helper resolusi path file agar aman di lokal maupun Vercel serverless
+function resolveProjectFile(relativePath) {
+  const localPath = path.join(__dirname, relativePath);
+  if (fs.existsSync(localPath)) return localPath;
+  const cwdPath = path.join(process.cwd(), relativePath);
+  if (fs.existsSync(cwdPath)) return cwdPath;
+  return localPath;
 }
 
-const ragEngine = new RAGEngine(path.join(__dirname, "data/products.csv"));
+// Inisialisasi Groq SDK
+let groq = null;
+function getGroqClient() {
+  if (!groq && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq") {
+    groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+  }
+  return groq;
+}
+getGroqClient();
 
-const KNOWLEDGE_PATH = path.join(__dirname, "knowledge.json");
+// Inisialisasi RAG Engine dengan dataset Kick Avenue
+const PRODUCTS_CSV_PATH = resolveProjectFile("data/products.csv");
+const ragEngine = new RAGEngine(PRODUCTS_CSV_PATH);
+
+// Load Basis Pengetahuan FAQ Manual
+const KNOWLEDGE_PATH = resolveProjectFile("knowledge.json");
 let knowledge = { keywords: {}, responses: {} };
 function loadKnowledge() {
   try {
-    if (fs.existsSync(KNOWLEDGE_PATH)) {
-      knowledge = JSON.parse(fs.readFileSync(KNOWLEDGE_PATH, "utf-8"));
+    const targetPath = resolveProjectFile("knowledge.json");
+    if (fs.existsSync(targetPath)) {
+      knowledge = JSON.parse(fs.readFileSync(targetPath, "utf-8"));
     }
   } catch (err) {
-    console.error("Gagal membaca knowledge.json:", err);
+    console.error("Gagal membaca knowledge.json:", err.message);
   }
 }
 loadKnowledge();
 
+// State WhatsApp Bot
 let client = null;
 let qrCodeData = null;
 let isReady = false;
 let isInitializing = false;
 let isCleaning = false;
 
+// ================= MONITORING TOKEN & RATE LIMIT GROQ AI =================
 let groqQuota = {
   model: process.env.GROQ_MODEL || "qwen/qwen3.8-27b",
   remainingRequests: null,
@@ -50,7 +69,11 @@ let groqQuota = {
   limitTokens: null,
   resetRequests: null,
   lastChecked: null,
-  configured: Boolean(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq")
+  configured: Boolean(process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq"),
+  totalTokensUsed: 0,
+  promptTokensUsed: 0,
+  completionTokensUsed: 0,
+  totalChatsHandled: 0
 };
 
 function updateGroqQuotaFromHeaders(headers, modelName) {
@@ -72,14 +95,12 @@ function updateGroqQuotaFromHeaders(headers, modelName) {
 }
 
 async function fetchGroqQuotaFresh() {
-  if (!groq && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq") {
-    groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
-  }
-  if (!groq) return groqQuota;
+  const groqClient = getGroqClient();
+  if (!groqClient) return groqQuota;
 
   const modelToUse = process.env.GROQ_MODEL || "qwen/qwen3.8-27b";
   try {
-    const { response } = await groq.chat.completions.create({
+    const { response } = await groqClient.chat.completions.create({
       model: modelToUse,
       messages: [{ role: "user", content: "ping" }],
       max_tokens: 1
@@ -91,9 +112,10 @@ async function fetchGroqQuotaFresh() {
   return groqQuota;
 }
 
+// ================= CONVERSATION HISTORY (MULTI-TURN MEMORY) =================
 const conversationHistory = new Map();
 const MAX_HISTORY_MESSAGES = 6;
-const SESSION_TTL_MS = 20 * 60 * 1000;
+const SESSION_TTL_MS = 20 * 60 * 1000; // 20 menit
 
 function getUserHistory(senderId) {
   if (!senderId) return [];
@@ -123,6 +145,7 @@ function appendUserHistory(senderId, userMsg, botReply) {
   conversationHistory.set(senderId, session);
 }
 
+// ================= DETEKSI BROWSER & INISIALISASI WHATSAPP =================
 function getChromeExecutablePath() {
   if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
     return process.env.CHROME_PATH;
@@ -131,7 +154,11 @@ function getChromeExecutablePath() {
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
     process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, "Google\\Chrome\\Application\\chrome.exe") : "",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
     "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/bin/chromium-browser",
     "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
   ].filter(Boolean);
 
@@ -142,13 +169,33 @@ function getChromeExecutablePath() {
 }
 
 function initializeClient() {
+  if (IS_VERCEL) {
+    throw new Error("WhatsApp Web client tidak dijalankan di lingkungan serverless Vercel.");
+  }
   if (client) return client;
+
+  // Lazy-load whatsapp-web.js & qrcode-terminal agar tidak membebani Vercel
+  const { Client, LocalAuth } = require("whatsapp-web.js");
+  const qrcode = require("qrcode-terminal");
+
   const puppeteerOptions = {
     headless: true,
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--disable-gpu"
+    ]
   };
+
   const detectedChrome = getChromeExecutablePath();
-  if (detectedChrome) puppeteerOptions.executablePath = detectedChrome;
+  if (detectedChrome) {
+    puppeteerOptions.executablePath = detectedChrome;
+    console.log(`[Puppeteer] Menggunakan browser: ${detectedChrome}`);
+  }
 
   client = new Client({
     authStrategy: new LocalAuth({ clientId: "chatbot-rag" }),
@@ -160,17 +207,28 @@ function initializeClient() {
     isInitializing = false;
     console.log("\n================ KODE QR WHATSAPP ================");
     qrcode.generate(qr, { small: true });
+    console.log("Pindai QR code di atas atau melalui dashboard web.");
     console.log("==================================================\n");
+  });
+
+  client.on("authenticated", () => {
+    console.log("Autentikasi WhatsApp berhasil.");
+  });
+
+  client.on("auth_failure", msg => {
+    console.error("Autentikasi WhatsApp gagal:", msg);
+    isInitializing = false;
   });
 
   client.on("ready", () => {
     isReady = true;
     isInitializing = false;
     qrCodeData = null;
-    console.log("Bot WhatsApp siap digunakan!");
+    console.log("Bot WhatsApp Kick Avenue siap digunakan!");
   });
 
   client.on("disconnected", reason => {
+    console.log("WhatsApp terputus:", reason);
     isReady = false;
     qrCodeData = null;
     client = null;
@@ -179,18 +237,29 @@ function initializeClient() {
   client.on("message", async msg => {
     try {
       if (msg.fromMe || !msg.body) return;
-      if (!msg.from.endsWith("@c.us") && !msg.from.endsWith("@lid")) return;
+      const isPersonalChat = msg.from.endsWith("@c.us") || msg.from.endsWith("@lid");
+      if (!isPersonalChat || msg.from.endsWith("@status")) return;
+
       const message = msg.body.trim();
+      console.log(`[Pesan Masuk dari ${msg.from}]: ${message}`);
+
       const reply = await getAIResponse(msg.from, message);
       await msg.reply(reply);
+      console.log(`[Balasan Terkirim]: ${reply}`);
     } catch (err) {
-      console.error("Error:", err);
+      console.error("Error memproses pesan:", err.message || err);
+      try {
+        await msg.reply("Mohon maaf, sistem asisten Kick Avenue sedang mengalami kendala teknis. Silakan coba sesaat lagi.");
+      } catch (replyErr) {
+        console.error("Gagal mengirim pesan fallback:", replyErr.message);
+      }
     }
   });
 
   return client;
 }
 
+// ================= LOGIKA RESPONS AI & RAG KICK AVENUE =================
 function formatWhatsAppMessage(text) {
   if (!text) return "";
   let formatted = text.replace(/\*\*(.*?)\*\*/g, "*$1*");
@@ -200,10 +269,14 @@ function formatWhatsAppMessage(text) {
 function isGreetingMessage(text) {
   if (!text) return false;
   const q = text.toLowerCase().trim();
-  const greetings = ["halo", "hai", "hi", "hey", "hello", "p", "ping", "pagi", "siang", "sore", "malam", "assalamualaikum", "permisi"];
+  const greetings = [
+    "halo", "hai", "hi", "hey", "hello", "hei", "p", "ping", "test",
+    "pagi", "selamat pagi", "siang", "selamat siang", "sore", "selamat sore",
+    "malam", "selamat malam", "assalamualaikum", "assalamu'alaikum", "permisi"
+  ];
   if (greetings.includes(q)) return true;
-  if (/^(halo|hai|hi|hey|selamat\s+(pagi|siang|sore|malam)|assalamu\s*alaikum)\b/i.test(q)) {
-    const productKeywords = ["produk", "harga", "katalog", "jual", "beli", "sepatu", "sneakers", "nike", "adidas", "jordan"];
+  if (/^(halo|hai|hi|hey|hello|selamat\s+(pagi|siang|sore|malam)|assalamu\s*alaikum|permisi)\b/i.test(q)) {
+    const productKeywords = ["produk", "harga", "katalog", "jual", "beli", "sepatu", "sneakers", "nike", "adidas", "jordan", "puma", "new balance"];
     return !productKeywords.some(pk => q.includes(pk));
   }
   return false;
@@ -212,52 +285,80 @@ function isGreetingMessage(text) {
 function isGratitudeMessage(text) {
   if (!text) return false;
   const q = text.toLowerCase().trim();
-  const gratitudeList = ["terima kasih", "terimakasih", "makasih", "thx", "thanks", "thank you"];
+  const gratitudeList = ["terima kasih", "terimakasih", "makasih", "makasi", "thx", "thanks", "thank you", "matur nuwun"];
   if (gratitudeList.includes(q)) return true;
-  return /^(terima\s*kasih|makasih|thanks|thank\s*you|thx)\b/i.test(q);
+  return /^(terima\s*kasih|makasih|makasi|thanks|thank\s*you|thx)\b/i.test(q);
 }
 
 async function getAIResponse(senderId, message) {
   const normalized = message.toLowerCase().trim();
 
+  // 1. Template Cepat: Sapaan
   if (isGreetingMessage(normalized)) {
-    const greetingReply = "Halo! Selamat datang di *Kick Hype Store*. ✨ Ada yang bisa kami bantu seputar koleksi sneakers dan streetwear kami hari ini? 😊";
+    const greetingReply = "Halo! Selamat datang di *Kick Avenue*. ✨ Ada yang bisa kami bantu seputar koleksi sneakers dan streetwear original kami hari ini?";
     if (senderId) appendUserHistory(senderId, message, greetingReply);
     return greetingReply;
   }
 
+  // 2. Template Cepat: Terima Kasih
   if (isGratitudeMessage(normalized)) {
-    const gratitudeReply = "Sama-sama! Senang bisa membantu Anda di *Kick Hype Store*. Jika ada pertanyaan lain atau ingin memesan, silakan hubungi kami kembali ya! 😊";
+    const gratitudeReply = "Sama-sama! Senang bisa membantu Anda di *Kick Avenue*. Jika ada pertanyaan lain atau ingin melakukan pemesanan, silakan hubungi kami kembali!";
     if (senderId) appendUserHistory(senderId, message, gratitudeReply);
     return gratitudeReply;
   }
 
+  // 3. FAQ Manual Langsung (knowledge.json)
   if (knowledge.responses && knowledge.responses[normalized]) {
     const manualReply = formatWhatsAppMessage(knowledge.responses[normalized]);
     if (senderId) appendUserHistory(senderId, message, manualReply);
     return manualReply;
   }
 
+  // 4. FAQ Keyword Alias (knowledge.json)
+  if (knowledge.keywords) {
+    for (const [kw, targetKey] of Object.entries(knowledge.keywords)) {
+      if (normalized.includes(kw.toLowerCase())) {
+        if (knowledge.responses && knowledge.responses[targetKey]) {
+          const manualReply = formatWhatsAppMessage(knowledge.responses[targetKey]);
+          if (senderId) appendUserHistory(senderId, message, manualReply);
+          return manualReply;
+        }
+      }
+    }
+  }
+
+  // 5. Retrieval Konteks Produk dari CSV Kick Avenue
   const history = senderId ? getUserHistory(senderId) : [];
   let ragContext = ragEngine.buildContext(message);
 
   if (!ragContext && history.length > 0) {
-    const prevUserQueries = history.filter(h => h.role === "user").slice(-2).map(h => h.content).join(" ");
+    const prevUserQueries = history
+      .filter(h => h.role === "user")
+      .slice(-2)
+      .map(h => h.content)
+      .join(" ");
     ragContext = ragEngine.buildContext(`${prevUserQueries} ${message}`);
   }
 
+  // 6. Inferensi Groq LLM
   try {
-    if (!groq && process.env.GROQ_API_KEY && process.env.GROQ_API_KEY !== "isi_api_key_groq") {
-      groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+    const groqClient = getGroqClient();
+    if (!groqClient) {
+      return "Halo! Sistem asisten *Kick Avenue* sedang offline karena API Key Groq belum dikonfigurasi pada file .env.";
     }
-    if (!groq) return "Halo! API Key Groq belum dikonfigurasi di file .env.";
 
-    const systemPrompt = `Anda adalah konsultan sneakers dan streetwear resmi dari "Kick Hype Store". Jawab dalam Bahasa Indonesia yang ramah, hangat, natural, dan to the point.
+    const systemPrompt = `Anda adalah konsultan sneakers dan streetwear resmi dari "Kick Avenue". Jawab dalam Bahasa Indonesia yang ramah, hangat, natural, dan to the point.
+
 PRINSIP KEAKURATAN DATA PRODUK:
-Jawab HANYA berdasarkan informasi produk pada Konteks Katalog di bawah. Jangan mengarang spesifikasi di luar katalog.
-Gunakan format WhatsApp bold (*teks*) dan bullet points (-) untuk daftar produk. Jangan satukan dalam paragraf panjang.
-Jika informasi tidak ada, arahkan untuk menghubungi kontak resmi: Jl. Sudirman No. 45, Jakarta Selatan (Telp/WA: 021-555-8899).
-${ragContext ? ragContext : "Konteks Katalog: (Tidak ada produk spesifik yang dicari)."}`;
+- Jawab HANYA berdasarkan informasi produk resmi pada Konteks Katalog di bawah. Jangan mengarang harga, ukuran (size), atau spesifikasi di luar katalog.
+- Gunakan format cetak tebal WhatsApp satu bintang (*teks*) dan daftar poin (-) untuk menampilkan produk. Jangan satukan dalam paragraf panjang.
+- Jangan menyebut istilah internal sistem seperti "file CSV" atau "konteks RAG".
+- Jika pelanggan menanyakan ketersediaan ukuran (size), stok fisik terkini, atau produk yang tidak tercantum di katalog, sampaikan dengan sopan dan sertakan kontak resmi toko:
+  Alamat: Jl. Sudirman No. 45, Jakarta Selatan
+  Telepon / WA: (021) 555-8899 / Chat WhatsApp ini
+  Jam Operasional: Senin - Sabtu (10.00 - 21.00 WIB)
+
+${ragContext ? ragContext : "Konteks Katalog: (Tidak ada produk spesifik yang ditemukan untuk kueri ini)."}`;
 
     const messagesPayload = [
       { role: "system", content: systemPrompt },
@@ -265,27 +366,50 @@ ${ragContext ? ragContext : "Konteks Katalog: (Tidak ada produk spesifik yang di
       { role: "user", content: message }
     ];
 
-    const candidateModels = [process.env.GROQ_MODEL || "qwen/qwen3.8-27b", "openai/gpt-oss-20b", "allam-2-7b"];
+    const candidateModels = [
+      process.env.GROQ_MODEL || "qwen/qwen3.8-27b",
+      "openai/gpt-oss-20b",
+      "allam-2-7b"
+    ];
+
+    let lastError = null;
     for (const modelName of candidateModels) {
       try {
-        const { data: completion, response } = await groq.chat.completions.create({
+        const { data: completion, response } = await groqClient.chat.completions.create({
           model: modelName,
           messages: messagesPayload,
           max_tokens: Number(process.env.GROQ_MAX_TOKENS || 1500)
         }).withResponse();
 
-        if (response && response.headers) updateGroqQuotaFromHeaders(response.headers, modelName);
+        if (response && response.headers) {
+          updateGroqQuotaFromHeaders(response.headers, modelName);
+        }
+
+        if (completion.usage) {
+          groqQuota.promptTokensUsed += Number(completion.usage.prompt_tokens || 0);
+          groqQuota.completionTokensUsed += Number(completion.usage.completion_tokens || 0);
+          groqQuota.totalTokensUsed += Number(completion.usage.total_tokens || 0);
+          groqQuota.totalChatsHandled += 1;
+        }
+
         if (completion.choices && completion.choices[0] && completion.choices[0].message) {
           const aiReply = formatWhatsAppMessage(completion.choices[0].message.content);
           if (senderId) appendUserHistory(senderId, message, aiReply);
           return aiReply;
         }
-      } catch (err) {}
+      } catch (err) {
+        lastError = err;
+        console.warn(`[Groq Model ${modelName}] Gagal: ${err.message}`);
+      }
     }
-    throw new Error("Semua model Groq gagal merespon.");
+
+    throw lastError || new Error("Semua model Groq gagal merespon.");
   } catch (error) {
-    if (ragContext) return formatWhatsAppMessage(`Berikut informasi dari katalog kami:\n\n${ragContext}`);
-    return formatWhatsAppMessage("Halo! Selamat datang di *Kick Hype Store*. Ada yang bisa kami bantu?");
+    console.error("Error Groq API:", error.message || error);
+    if (ragContext) {
+      return formatWhatsAppMessage(`Halo! Berikut informasi produk dari katalog *Kick Avenue*:\n\n${ragContext}`);
+    }
+    return formatWhatsAppMessage("Halo! Selamat datang di *Kick Avenue*. Ada koleksi sneakers atau apparel yang sedang Anda cari hari ini?");
   }
 }
 
@@ -298,55 +422,69 @@ function maskPhoneNumber(rawNumber) {
   return formatted;
 }
 
+// ================= API ENDPOINTS =================
 app.get("/api/bot/status", (req, res) => {
   let botNumber = null;
   if (isReady && client && client.info && client.info.wid) {
     botNumber = maskPhoneNumber(client.info.wid.user);
   }
-  res.json({ isReady, isInitializing, isCleaning, hasQRCode: Boolean(qrCodeData), botNumber });
+  res.json({
+    isReady,
+    isInitializing,
+    isCleaning,
+    hasQRCode: Boolean(qrCodeData),
+    botNumber,
+    environment: IS_VERCEL ? "vercel" : "local"
+  });
 });
 
 app.get("/api/groq/quota", async (req, res) => {
-  const isFresh = req.query.fresh === "true" || groqQuota.remainingRequests === null;
-  if (isFresh) await fetchGroqQuotaFresh();
-  res.json(groqQuota);
+  try {
+    const isFresh = req.query.fresh === "true" || groqQuota.remainingRequests === null;
+    if (isFresh && !IS_VERCEL) {
+      await fetchGroqQuotaFresh();
+    }
+    res.json(groqQuota);
+  } catch (err) {
+    res.status(500).json({ error: err.message, ...groqQuota });
+  }
 });
 
-app.get("/api/bot/qr", (req, res) => res.json({ qr: qrCodeData }));
+app.get("/api/bot/qr", (req, res) => {
+  res.json({ qr: qrCodeData });
+});
 
 app.post("/api/bot/start", async (req, res) => {
-  if (isReady) return res.json({ success: true, message: "Bot sudah berjalan." });
-  if (isInitializing) return res.json({ success: true, message: "Inisialisasi..." });
-  isInitializing = true;
-  const waClient = initializeClient();
-  await waClient.initialize();
-  res.json({ success: true });
+  if (IS_VERCEL) {
+    return res.status(400).json({
+      success: false,
+      message: "Gateway WhatsApp hanya dijalankan di server lokal. Vercel berfungsi sebagai katalog web publik."
+    });
+  }
+  try {
+    if (isReady) return res.json({ success: true, message: "Bot sudah berjalan." });
+    if (isInitializing) return res.json({ success: true, message: "Bot sedang proses inisialisasi..." });
+
+    isInitializing = true;
+    const waClient = initializeClient();
+    await waClient.initialize();
+    res.json({ success: true });
+  } catch (err) {
+    isInitializing = false;
+    console.error("Gagal memulai bot:", err.message);
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
 app.post("/api/bot/stop", async (req, res) => {
-  isCleaning = true;
-  isReady = false;
-  qrCodeData = null;
-  if (client) await client.destroy();
-  client = null;
-  isCleaning = false;
-  res.json({ success: true });
-});
-
-app.post("/api/bot/reset", async (req, res) => {
-  isCleaning = true;
-  isReady = false;
-  isInitializing = false;
-  qrCodeData = null;
-  if (client) { try { await client.destroy(); } catch (e) {} client = null; }
-  if (fs.existsSync(".wwebjs_auth")) fs.rmSync(".wwebjs_auth", { recursive: true, force: true });
-  if (fs.existsSync(".wwebjs_cache")) fs.rmSync(".wwebjs_cache", { recursive: true, force: true });
-  conversationHistory.clear();
-  isCleaning = false;
-  res.json({ success: true, message: "Sesi berhasil dibersihkan." });
-});
-
-app.get("/api/knowledge", (req, res) => { loadKnowledge(); res.json(knowledge); });
-app.get("/api/products", (req, res) => { ragEngine.loadData(); res.json({ products: ragEngine.products }); });
-
-app.listen(PORT, () => console.log(`Server berjalan di http://localhost:${PORT}`));
+  if (IS_VERCEL) return res.json({ success: false });
+  try {
+    isCleaning = true;
+    isReady = false;
+    qrCodeData = null;
+    if (client) await client.destroy();
+    client = null;
+    isCleaning = false;
+    res.json({ success: true });
+  } catch (err) {
+    isCleaning
