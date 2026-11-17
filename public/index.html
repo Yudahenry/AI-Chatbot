@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dashboard Bot WhatsApp - Kick Avenue</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="container">
+    <section class="header">
+      <div class="header-title">
+        <h1>Bot WhatsApp RAG - Kick Avenue</h1>
+        <p class="subtitle">Integrasi Chatbot WhatsApp dengan Groq AI & RAG Katalog Sneakers</p>
+      </div>
+      <div class="status-wrapper">
+        <span class="status-indicator" id="statusDot"></span>
+        <span id="statusText">Bot Offline</span>
+      </div>
+      <div class="btn-group">
+        <button id="startBtn">Mulai Bot</button>
+        <button id="stopBtn" class="hidden">Hentikan Bot</button>
+        <button id="resetBtn">Reset Sesi WA</button>
+      </div>
+    </section>
+
+    <section id="qrSection" class="panel hidden">
+      <h2>Pindai Kode QR WhatsApp</h2>
+      <p>Buka WhatsApp di HP Anda, buka menu <strong>Perangkat Tertaut</strong>, lalu scan QR Code berikut:</p>
+      <div id="qrcode">
+        <div class="loading-spinner">Menunggu kode QR dari WhatsApp...</div>
+      </div>
+    </section>
+
+    <section id="readySection" class="panel hidden">
+      <div class="ready-badge">
+        <div class="ready-content">
+          <div class="ready-header-row">
+            <h2>Bot Terhubung</h2>
+            <span id="botNumberBadge" class="bot-number-badge">Nomor WA: <strong id="botNumberText">-</strong></span>
+          </div>
+          <p>Bot siap menerima dan membalas pesan otomatis menggunakan Groq AI & RAG.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Katalog Produk Kick Hype (RAG Source)</h2>
+      <p class="section-desc">Data produk dari <code>data/products.csv</code> yang dijadikan acuan LLM.</p>
+      <div class="table-responsive">
+        <table>
+          <thead>
+            <tr>
+              <th>Nama Produk</th>
+              <th>Kategori</th>
+              <th>Harga</th>
+              <th>Deskripsi & Tautan WA</th>
+            </tr>
+          </thead>
+          <tbody id="productsBody">
+            <tr><td colspan="4" style="text-align:center;">Memuat data produk...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

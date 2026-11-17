@@ -1,0 +1,16 @@
+{
+  "keywords": {
+    "jam buka": "jam buka",
+    "alamat": "alamat",
+    "lokasi": "alamat",
+    "cara pesan": "cara pesan",
+    "order": "cara pesan",
+    "kontak": "kontak"
+  },
+  "responses": {
+    "jam buka": "Store Kick Hype buka setiap hari Senin - Sabtu pukul 10.00 - 21.00 WIB, dan Minggu pukul 11.00 - 18.00 WIB.",
+    "alamat": "Store utama Kick Hype / Kick Avenue beralamat di Jl. Sudirman No. 45, Jakarta Selatan.",
+    "cara pesan": "Untuk pemesanan, silakan sebutkan nama sepatu atau produk yang diinginkan dari katalog kami, lalu konfirmasikan melalui chat ini.",
+    "kontak": "Informasi Kontak Toko Kick Hype / Kick Avenue:\n*Alamat:* Jl. Sudirman No. 45, Jakarta Selatan\n*Telepon / WA:* (021) 555-8899 / Chat WhatsApp ini\n*Jam Operasional:* Senin - Sabtu (10.00 - 21.00 WIB)"
+  }
+}
