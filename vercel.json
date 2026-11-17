@@ -1,33 +1,19 @@
 {
-  "version": 2,
-  "builds": [
-    {
-      "src": "server-v2.js",
-      "use": "@vercel/node",
-      "config": {
-        "includeFiles": [
-          "data/**",
-          "knowledge.json"
-        ]
-      }
-    },
-    {
-      "src": "public/**",
-      "use": "@vercel/static"
+  "build": {
+    "env": {
+      "PUPPETEER_SKIP_DOWNLOAD": "true",
+      "PUPPETEER_SKIP_CHROMIUM_DOWNLOAD": "true"
     }
-  ],
-  "routes": [
+  },
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "{data/**,knowledge.json}"
+    }
+  },
+  "rewrites": [
     {
-      "src": "/api/(.*)",
-      "dest": "/server-v2.js"
-    },
-    {
-      "src": "/(.+)",
-      "dest": "/public/$1"
-    },
-    {
-      "src": "/",
-      "dest": "/public/index.html"
+      "source": "/api/(.*)",
+      "destination": "/api/index.js"
     }
   ]
 }
